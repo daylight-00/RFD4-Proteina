@@ -920,22 +920,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
                 tail_step_multiplier=schedule_args.get("tail_step_multiplier", 1),
             )
 
-        gt = {}
-        for data_mode in self.data_modes:
-            gt_args = sampling_model_args[data_mode]["gt"]
-            ssp = sampling_model_args[data_mode]["simulation_step_params"]
-            g = get_gt(
-                t=ts[data_mode][:-1],  # [nsteps], ts[-1]=1 not used to eval
-                mode=gt_args["mode"],
-                param=gt_args["p"],
-                clamp_val=gt_args["clamp_val"],
-            )
-            # Use the TSR-rescaled score with a matched Langevin drift and noise schedule.
-            if ssp["sampling_mode"] == "vf_tsr":
-                g = g / compute_tsr_ratio(ts[data_mode][:-1], ssp.get("tsr_k", 1.0), ssp.get("tsr_sigma", 1.0)) ** 2
-            gt[data_mode] = g
-
-        return ts, gt
+        return ts, get_noise_schedule(ts, sampling_model_args)
 
     def partial_simulation(
         self,
@@ -1088,6 +1073,37 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             "sequence_logits": final_sequence_logits,
         }
         return x, x_1_pred, extra_info
+
+
+def get_noise_schedule(
+    ts: dict[str, Float[Tensor, "nsteps_plus_1"]],
+    sampling_model_args: dict[str, dict],
+) -> dict[str, Float[Tensor, "nsteps"]]:
+    """Noise injection schedule (gt) matching the given time schedules.
+
+    Args:
+        ts: Time schedule per modality, dict of tensors [nsteps+1].
+        sampling_model_args: Per-modality sampling configuration, as for ``sample_schedule``.
+
+    Returns:
+        gt per modality, dict of tensors [nsteps], one coefficient for each step of ``ts``.
+    """
+    gt = {}
+    for data_mode, t in ts.items():
+        gt_args = sampling_model_args[data_mode]["gt"]
+        ssp = sampling_model_args[data_mode]["simulation_step_params"]
+        g = get_gt(
+            t=t[:-1],  # [nsteps], ts[-1]=1 not used to eval
+            mode=gt_args["mode"],
+            param=gt_args["p"],
+            clamp_val=gt_args["clamp_val"],
+        )
+        # Use the TSR-rescaled score with a matched Langevin drift and noise schedule.
+        if ssp["sampling_mode"] == "vf_tsr":
+            g = g / compute_tsr_ratio(t[:-1], ssp.get("tsr_k", 1.0), ssp.get("tsr_sigma", 1.0)) ** 2
+        gt[data_mode] = g
+
+    return gt
 
 
 def get_gt(

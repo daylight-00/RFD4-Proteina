@@ -6,10 +6,13 @@ import numpy as np
 import torch
 from atomworks.io.utils.atom_array_plus import as_atom_array_plus_stack
 
+from rfproteina.flow_matching.product_space_flow_matcher import get_noise_schedule
 from rfproteina.search.base_strategy import SearchStrategy
 
 RESAMPLED_FORWARD_MARGINAL = "resampled_forward_marginal"
 INVERSE_FOLDING_METHODS = {RESAMPLED_FORWARD_MARGINAL}
+# Largest schedule built to resolve an explicit partial_t; close to 1 the grid has to be very fine.
+MAX_EXPANDED_STEPS = 1 << 20
 
 
 def resolve_inverse_folding_method(cfg_args: Any) -> str | None:
@@ -36,6 +39,13 @@ def _validate_partial_t(partial_t_dict: dict[str, float]) -> dict[str, float]:
             "partial_t_latent, or raise partial_trajectory_fraction_steps."
         )
     return partial_t_dict
+
+
+def _partial_t_too_close_to_one(data_mode: str, partial_t: float, nsteps: int) -> ValueError:
+    return ValueError(
+        f"{data_mode}: partial_t={partial_t} is too close to 1 to resolve {nsteps} steps. "
+        "Lower partial_t_backbone / partial_t_latent, or use fewer steps."
+    )
 
 
 def resolve_partial_t(
@@ -149,6 +159,10 @@ def build_partial_schedule(
     Returns:
         Tuple of (ts, gt) partial schedules, each a dict of tensors with
         ts[dm] shape [nsteps+1] and gt[dm] shape [nsteps].
+
+    Raises:
+        ValueError: If an explicit start time is too close to 1 for ``nsteps`` distinct float32 times
+            above it, or resolving it takes a schedule of more than ``MAX_EXPANDED_STEPS`` points.
     """
     if full_nsteps is not None:
         if not 1 <= nsteps <= full_nsteps:
@@ -174,9 +188,30 @@ def build_partial_schedule(
         n_above = max(nsteps_dense - i_start, 1)
 
         nsteps_expanded = round(nsteps * nsteps_dense / n_above)
+        n_representable = (1.0 - pt) / (torch.finfo(dense_ts[data_mode].dtype).eps / 2)  # float32 times above ``pt``
+        if pt > 0 and (n_representable < nsteps or nsteps_expanded > MAX_EXPANDED_STEPS):
+            raise _partial_t_too_close_to_one(data_mode, pt, nsteps)
         full_ts, full_gt = fm.sample_schedule(nsteps=nsteps_expanded, sampling_model_args=sampling_model_args)
-        partial_ts[data_mode] = full_ts[data_mode][-(nsteps + 1) :]
-        partial_gt[data_mode] = full_gt[data_mode][-nsteps:]
+        ts, gt = full_ts[data_mode], full_gt[data_mode]
+        # The expanded grid only approximates ``pt`` but the state was noised to exactly ``pt``, so start there and
+        # recompute the noise schedule. ``pt == 0`` (inverse folding) keeps the schedule's own start: a TSR schedule
+        # starts above 0 because ``t == 0`` is a no-op step.
+        if pt > 0 and abs(ts[-(nsteps + 1)].item() - pt) > 1e-6:
+            start = ts.new_tensor(pt)
+            # Close to 1 the grid can have fewer than ``nsteps`` times above ``pt``; scale it up until it has enough.
+            while (n_after := int((ts > start).sum())) < nsteps:
+                nsteps_expanded = nsteps_expanded * nsteps // max(n_after, 1) + 1
+                if nsteps_expanded > MAX_EXPANDED_STEPS:
+                    raise _partial_t_too_close_to_one(data_mode, pt, nsteps)
+                full_ts, full_gt = fm.sample_schedule(nsteps=nsteps_expanded, sampling_model_args=sampling_model_args)
+                ts, gt = full_ts[data_mode], full_gt[data_mode]
+            ts = ts.clone()
+            ts[-(nsteps + 1)] = start
+            if not (ts[-(nsteps + 1) :].diff() > 0).all():
+                raise _partial_t_too_close_to_one(data_mode, pt, nsteps)
+            gt = get_noise_schedule({data_mode: ts}, sampling_model_args)[data_mode]
+        partial_ts[data_mode] = ts[-(nsteps + 1) :]
+        partial_gt[data_mode] = gt[-nsteps:]
 
     return partial_ts, partial_gt
 
